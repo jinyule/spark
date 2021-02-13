@@ -28,8 +28,8 @@ import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.plans.physical.{AllTuples, ClusteredDistribution, Distribution, Partitioning}
 import org.apache.spark.sql.execution.{GroupedIterator, SparkPlan, UnaryExecNode}
-import org.apache.spark.sql.execution.arrow.ArrowUtils
 import org.apache.spark.sql.types.{DataType, StructField, StructType}
+import org.apache.spark.sql.util.ArrowUtils
 import org.apache.spark.util.Utils
 
 /**
@@ -79,8 +79,6 @@ case class AggregateInPandasExec(
   override protected def doExecute(): RDD[InternalRow] = {
     val inputRDD = child.execute()
 
-    val bufferSize = inputRDD.conf.getInt("spark.buffer.size", 65536)
-    val reuseWorker = inputRDD.conf.getBoolean("spark.python.worker.reuse", defaultValue = true)
     val sessionLocalTimeZone = conf.sessionLocalTimeZone
     val pythonRunnerConf = ArrowUtils.getPythonRunnerConfMap(conf)
 
@@ -105,10 +103,11 @@ case class AggregateInPandasExec(
     // Schema of input rows to the python runner
     val aggInputSchema = StructType(dataTypes.zipWithIndex.map { case (dt, i) =>
       StructField(s"_$i", dt)
-    })
+    }.toSeq)
 
-    inputRDD.mapPartitionsInternal { iter =>
-      val prunedProj = UnsafeProjection.create(allInputs, child.output)
+    // Map grouped rows to ArrowPythonRunner results, Only execute if partition is not empty
+    inputRDD.mapPartitionsInternal { iter => if (iter.isEmpty) iter else {
+      val prunedProj = UnsafeProjection.create(allInputs.toSeq, child.output)
 
       val grouped = if (groupingExpressions.isEmpty) {
         // Use an empty unsafe row as a place holder for the grouping key
@@ -125,7 +124,7 @@ case class AggregateInPandasExec(
       // combine input with output from Python.
       val queue = HybridRowQueue(context.taskMemoryManager(),
         new File(Utils.getLocalDir(SparkEnv.get.conf)), groupingExpressions.length)
-      context.addTaskCompletionListener { _ =>
+      context.addTaskCompletionListener[Unit] { _ =>
         queue.close()
       }
 
@@ -137,8 +136,6 @@ case class AggregateInPandasExec(
 
       val columnarBatchIter = new ArrowPythonRunner(
         pyFuncs,
-        bufferSize,
-        reuseWorker,
         PythonEvalType.SQL_GROUPED_AGG_PANDAS_UDF,
         argOffsets,
         aggInputSchema,
@@ -155,6 +152,6 @@ case class AggregateInPandasExec(
         val joinedRow = joined(leftRow, aggOutputRow)
         resultProj(joinedRow)
       }
-    }
+    }}
   }
 }

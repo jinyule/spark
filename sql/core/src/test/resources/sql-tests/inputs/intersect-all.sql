@@ -59,29 +59,40 @@ INTERSECT ALL
 SELECT * FROM tab2;
 
 -- Chain of different `set operations
--- We need to parenthesize the following two queries to enforce
--- certain order of evaluation of operators. After fix to
--- SPARK-24966 this can be removed.
 SELECT * FROM tab1
 EXCEPT
 SELECT * FROM tab2
 UNION ALL
-(
 SELECT * FROM tab1
 INTERSECT ALL
 SELECT * FROM tab2
-);
+;
 
 -- Chain of different `set operations
 SELECT * FROM tab1
 EXCEPT
 SELECT * FROM tab2
 EXCEPT
-(
 SELECT * FROM tab1
 INTERSECT ALL
 SELECT * FROM tab2
-);
+;
+
+-- test use parenthesis to control order of evaluation
+(
+  (
+    (
+      SELECT * FROM tab1
+      EXCEPT
+      SELECT * FROM tab2
+    )
+    EXCEPT
+    SELECT * FROM tab1
+  )
+  INTERSECT ALL
+  SELECT * FROM tab2
+)
+;
 
 -- Join under intersect all
 SELECT * 
@@ -118,6 +129,47 @@ SELECT v FROM tab1 GROUP BY v
 INTERSECT ALL
 SELECT k FROM tab2 GROUP BY k;
 
+-- Test pre spark2.4 behaviour of set operation precedence
+-- All the set operators are given equal precedence and are evaluated
+-- from left to right as they appear in the query.
+
+-- Set the property
+SET spark.sql.legacy.setopsPrecedence.enabled= true;
+
+SELECT * FROM tab1
+EXCEPT
+SELECT * FROM tab2
+UNION ALL
+SELECT * FROM tab1
+INTERSECT ALL
+SELECT * FROM tab2;
+
+SELECT * FROM tab1
+EXCEPT
+SELECT * FROM tab2
+UNION ALL
+SELECT * FROM tab1
+INTERSECT
+SELECT * FROM tab2;
+
+-- Restore the property
+SET spark.sql.legacy.setopsPrecedence.enabled = false;
+
+-- SPARK-32638: corrects references when adding aliases in WidenSetOperationTypes
+CREATE OR REPLACE TEMPORARY VIEW tab3 AS VALUES (decimal(1)), (decimal(2)) tbl3(v);
+SELECT t.v FROM (
+  SELECT v FROM tab3
+  INTERSECT
+  SELECT v + v AS v FROM tab3
+) t;
+
+SELECT SUM(t.v) FROM (
+  SELECT v FROM tab3
+  INTERSECT
+  SELECT v + v AS v FROM tab3
+) t;
+
 -- Clean-up 
 DROP VIEW IF EXISTS tab1;
 DROP VIEW IF EXISTS tab2;
+DROP VIEW IF EXISTS tab3;

@@ -29,6 +29,7 @@ class RDDInfo(
     var name: String,
     val numPartitions: Int,
     var storageLevel: StorageLevel,
+    val isBarrier: Boolean,
     val parentIds: Seq[Int],
     val callSite: String = "",
     val scope: Option[RDDOperationScope] = None)
@@ -37,7 +38,6 @@ class RDDInfo(
   var numCachedPartitions = 0
   var memSize = 0L
   var diskSize = 0L
-  var externalBlockStoreSize = 0L
 
   def isCached: Boolean = (memSize + diskSize > 0) && numCachedPartitions > 0
 
@@ -55,16 +55,19 @@ class RDDInfo(
 }
 
 private[spark] object RDDInfo {
-  private val callsiteForm = SparkEnv.get.conf.get(EVENT_LOG_CALLSITE_FORM)
-
   def fromRdd(rdd: RDD[_]): RDDInfo = {
     val rddName = Option(rdd.name).getOrElse(Utils.getFormattedClassName(rdd))
     val parentIds = rdd.dependencies.map(_.rdd.id)
-    val callSite = callsiteForm match {
-      case "short" => rdd.creationSite.shortForm
-      case "long" => rdd.creationSite.longForm
+    val callsiteLongForm = Option(SparkEnv.get)
+      .map(_.conf.get(EVENT_LOG_CALLSITE_LONG_FORM))
+      .getOrElse(false)
+
+    val callSite = if (callsiteLongForm) {
+      rdd.creationSite.longForm
+    } else {
+      rdd.creationSite.shortForm
     }
     new RDDInfo(rdd.id, rddName, rdd.partitions.length,
-      rdd.getStorageLevel, parentIds, callSite, rdd.scope)
+      rdd.getStorageLevel, rdd.isBarrier(), parentIds, callSite, rdd.scope)
   }
 }

@@ -19,22 +19,22 @@ package org.apache.spark.sql.streaming
 
 import java.io.File
 import java.sql.Date
-import java.util.concurrent.ConcurrentHashMap
 
 import org.apache.commons.io.FileUtils
-import org.scalatest.BeforeAndAfterAll
 import org.scalatest.exceptions.TestFailedException
 
 import org.apache.spark.SparkException
 import org.apache.spark.api.java.function.FlatMapGroupsWithStateFunction
-import org.apache.spark.sql.Encoder
+import org.apache.spark.sql.{DataFrame, Encoder}
+import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{GenericInternalRow, UnsafeProjection, UnsafeRow}
 import org.apache.spark.sql.catalyst.plans.logical.FlatMapGroupsWithState
 import org.apache.spark.sql.catalyst.plans.physical.UnknownPartitioning
 import org.apache.spark.sql.catalyst.streaming.InternalOutputModes._
 import org.apache.spark.sql.execution.RDDScanExec
 import org.apache.spark.sql.execution.streaming._
-import org.apache.spark.sql.execution.streaming.state.{FlatMapGroupsWithStateExecHelper, StateStore, StateStoreId, StateStoreMetrics, UnsafeRowPair}
+import org.apache.spark.sql.execution.streaming.state.{FlatMapGroupsWithStateExecHelper, MemoryStateStore, StateStore}
+import org.apache.spark.sql.functions.timestamp_seconds
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.streaming.util.StreamManualClock
 import org.apache.spark.sql.types.{DataType, IntegerType}
@@ -45,18 +45,12 @@ case class RunningCount(count: Long)
 
 case class Result(key: Long, count: Int)
 
-class FlatMapGroupsWithStateSuite extends StateStoreMetricsTest
-    with BeforeAndAfterAll {
+class FlatMapGroupsWithStateSuite extends StateStoreMetricsTest {
 
   import testImplicits._
   import GroupStateImpl._
   import GroupStateTimeout._
   import FlatMapGroupsWithStateSuite._
-
-  override def afterAll(): Unit = {
-    super.afterAll()
-    StateStore.stop()
-  }
 
   test("GroupState - get, exists, update, remove") {
     var state: GroupStateImpl[String] = null
@@ -131,6 +125,8 @@ class FlatMapGroupsWithStateSuite extends StateStoreMetricsTest
     var state: GroupStateImpl[Int] = GroupStateImpl.createForStreaming(
       None, 1000, 1000, ProcessingTimeTimeout, hasTimedOut = false, watermarkPresent = false)
     assert(state.getTimeoutTimestamp === NO_TIMESTAMP)
+    state.setTimeoutDuration("-1 month 31 days 1 second")
+    assert(state.getTimeoutTimestamp === 2000)
     state.setTimeoutDuration(500)
     assert(state.getTimeoutTimestamp === 1500) // can be set without initializing state
     testTimeoutTimestampNotAllowed[UnsupportedOperationException](state)
@@ -231,8 +227,9 @@ class FlatMapGroupsWithStateSuite extends StateStoreMetricsTest
     testIllegalTimeout {
       state.setTimeoutDuration("-1 month")
     }
+
     testIllegalTimeout {
-      state.setTimeoutDuration("1 month -1 day")
+      state.setTimeoutDuration("1 month -31 day")
     }
 
     state = GroupStateImpl.createForStreaming(
@@ -247,7 +244,7 @@ class FlatMapGroupsWithStateSuite extends StateStoreMetricsTest
       state.setTimeoutTimestamp(10000, "-1 month")
     }
     testIllegalTimeout {
-      state.setTimeoutTimestamp(10000, "1 month -1 day")
+      state.setTimeoutTimestamp(10000, "1 month -32 day")
     }
     testIllegalTimeout {
       state.setTimeoutTimestamp(new Date(-10000))
@@ -259,7 +256,7 @@ class FlatMapGroupsWithStateSuite extends StateStoreMetricsTest
       state.setTimeoutTimestamp(new Date(-10000), "-1 month")
     }
     testIllegalTimeout {
-      state.setTimeoutTimestamp(new Date(-10000), "1 month -1 day")
+      state.setTimeoutTimestamp(new Date(-10000), "1 month -32 day")
     }
   }
 
@@ -273,7 +270,7 @@ class FlatMapGroupsWithStateSuite extends StateStoreMetricsTest
 
         val state2 = GroupStateImpl.createForStreaming(
           initState, 1000, 1000, timeoutConf, hasTimedOut = true, watermarkPresent = false)
-        assert(state2.hasTimedOut === true)
+        assert(state2.hasTimedOut)
       }
 
       // for batch queries
@@ -801,7 +798,7 @@ class FlatMapGroupsWithStateSuite extends StateStoreMetricsTest
         }
       },
       CheckNewAnswer(("c", "-1")),
-      assertNumStateRows(total = 0, updated = 0)
+      assertNumStateRows(total = 0, updated = 1)
     )
   }
 
@@ -829,7 +826,7 @@ class FlatMapGroupsWithStateSuite extends StateStoreMetricsTest
     val inputData = MemoryStream[(String, Int)]
     val result =
       inputData.toDS
-        .select($"_1".as("key"), $"_2".cast("timestamp").as("eventTime"))
+        .select($"_1".as("key"), timestamp_seconds($"_2").as("eventTime"))
         .withWatermark("eventTime", "10 seconds")
         .as[(String, Long)]
         .groupByKey(_._1)
@@ -904,7 +901,7 @@ class FlatMapGroupsWithStateSuite extends StateStoreMetricsTest
     val inputData = MemoryStream[(String, Int)]
     val result =
       inputData.toDS
-        .select($"_1".as("key"), $"_2".cast("timestamp").as("eventTime"))
+        .select($"_1".as("key"), timestamp_seconds($"_2").as("eventTime"))
         .withWatermark("eventTime", "10 seconds")
         .as[(String, Long)]
         .groupByKey(_._1)
@@ -1022,6 +1019,56 @@ class FlatMapGroupsWithStateSuite extends StateStoreMetricsTest
       spark.createDataset(Seq(("a", 2), ("b", 1))).toDF)
   }
 
+  testWithAllStateVersions("SPARK-29438: ensure UNION doesn't lead (flat)MapGroupsWithState" +
+    " to use shifted partition IDs") {
+    val stateFunc = (key: String, values: Iterator[String], state: GroupState[RunningCount]) => {
+      val count = state.getOption.map(_.count).getOrElse(0L) + values.size
+      state.update(RunningCount(count))
+      (key, count.toString)
+    }
+
+    def constructUnionDf(desiredPartitionsForInput1: Int)
+      : (MemoryStream[String], MemoryStream[String], DataFrame) = {
+      val input1 = MemoryStream[String](desiredPartitionsForInput1)
+      val input2 = MemoryStream[String]
+      val df1 = input1.toDF()
+        .select($"value", $"value")
+      val df2 = input2.toDS()
+        .groupByKey(x => x)
+        .mapGroupsWithState(stateFunc) // Types = State: MyState, Out: (Str, Str)
+        .toDF()
+
+      // Unioned DF would have columns as (String, String)
+      (input1, input2, df1.union(df2))
+    }
+
+    withTempDir { checkpointDir =>
+      val (input1, input2, unionDf) = constructUnionDf(2)
+      testStream(unionDf, Update)(
+        StartStream(checkpointLocation = checkpointDir.getAbsolutePath),
+        MultiAddData(input1, "input1-a")(input2, "input2-a"),
+        CheckNewAnswer(("input1-a", "input1-a"), ("input2-a", "1")),
+        StopStream
+      )
+
+      // We're restoring the query with different number of partitions in left side of UNION,
+      // which may lead right side of union to have mismatched partition IDs (e.g. if it relies on
+      // TaskContext.partitionId()). This test will verify (flat)MapGroupsWithState doesn't have
+      // such issue.
+
+      val (newInput1, newInput2, newUnionDf) = constructUnionDf(3)
+
+      newInput1.addData("input1-a")
+      newInput2.addData("input2-a")
+
+      testStream(newUnionDf, Update)(
+        StartStream(checkpointLocation = checkpointDir.getAbsolutePath),
+        MultiAddData(newInput1, "input1-a")(newInput2, "input2-a", "input2-b"),
+        CheckNewAnswer(("input1-a", "input1-a"), ("input2-a", "2"), ("input2-b", "1"))
+      )
+    }
+  }
+
   testQuietly("StateStore.abort on task failure handling") {
     val stateFunc = (key: String, values: Iterator[String], state: GroupState[RunningCount]) => {
       if (FlatMapGroupsWithStateSuite.failInTask) throw new Exception("expected failure")
@@ -1114,7 +1161,7 @@ class FlatMapGroupsWithStateSuite extends StateStoreMetricsTest
       val inputData = MemoryStream[(String, Long)]
       val result =
         inputData.toDF().toDF("key", "time")
-          .selectExpr("key", "cast(time as timestamp) as timestamp")
+          .selectExpr("key", "timestamp_seconds(time) as timestamp")
           .withWatermark("timestamp", "10 second")
           .as[(String, Long)]
           .groupByKey(x => x._1)
@@ -1168,7 +1215,7 @@ class FlatMapGroupsWithStateSuite extends StateStoreMetricsTest
 
     test(s"InputProcessor - process timed out state - $testName") {
       val mapGroupsFunc = (key: Int, values: Iterator[Int], state: GroupState[Int]) => {
-        assert(state.hasTimedOut === true, "hasTimedOut not true")
+        assert(state.hasTimedOut, "hasTimedOut not true")
         assert(values.isEmpty, "values not empty")
         stateUpdates(state)
         Iterator.empty
@@ -1230,6 +1277,7 @@ class FlatMapGroupsWithStateSuite extends StateStoreMetricsTest
       timeoutType: GroupStateTimeout = GroupStateTimeout.NoTimeout,
       batchTimestampMs: Long = NO_TIMESTAMP): FlatMapGroupsWithStateExec = {
     val stateFormatVersion = spark.conf.get(SQLConf.FLATMAPGROUPSWITHSTATE_STATE_FORMAT_VERSION)
+    val emptyRdd = spark.sparkContext.emptyRDD[InternalRow]
     MemoryStream[Int]
       .toDS
       .groupByKey(x => x)
@@ -1238,7 +1286,8 @@ class FlatMapGroupsWithStateSuite extends StateStoreMetricsTest
         case FlatMapGroupsWithState(f, k, v, g, d, o, s, m, _, t, _) =>
           FlatMapGroupsWithStateExec(
             f, k, v, g, d, o, None, s, stateFormatVersion, m, t,
-            Some(currentBatchTimestamp), Some(currentBatchWatermark), RDDScanExec(g, null, "rdd"))
+            Some(currentBatchTimestamp), Some(currentBatchWatermark),
+            RDDScanExec(g, emptyRdd, "rdd"))
       }.get
   }
 
@@ -1274,7 +1323,9 @@ class FlatMapGroupsWithStateSuite extends StateStoreMetricsTest
   def testWithAllStateVersions(name: String)(func: => Unit): Unit = {
     for (version <- FlatMapGroupsWithStateExecHelper.supportedVersions) {
       test(s"$name - state format version $version") {
-        withSQLConf(SQLConf.FLATMAPGROUPSWITHSTATE_STATE_FORMAT_VERSION.key -> version.toString) {
+        withSQLConf(
+            SQLConf.FLATMAPGROUPSWITHSTATE_STATE_FORMAT_VERSION.key -> version.toString,
+            SQLConf.STATEFUL_OPERATOR_CHECK_CORRECTNESS_ENABLED.key -> "false") {
           func
         }
       }
@@ -1285,27 +1336,6 @@ class FlatMapGroupsWithStateSuite extends StateStoreMetricsTest
 object FlatMapGroupsWithStateSuite {
 
   var failInTask = true
-
-  class MemoryStateStore extends StateStore() {
-    import scala.collection.JavaConverters._
-    private val map = new ConcurrentHashMap[UnsafeRow, UnsafeRow]
-
-    override def iterator(): Iterator[UnsafeRowPair] = {
-      map.entrySet.iterator.asScala.map { case e => new UnsafeRowPair(e.getKey, e.getValue) }
-    }
-
-    override def get(key: UnsafeRow): UnsafeRow = map.get(key)
-    override def put(key: UnsafeRow, newValue: UnsafeRow): Unit = {
-      map.put(key.copy(), newValue.copy())
-    }
-    override def remove(key: UnsafeRow): Unit = { map.remove(key) }
-    override def commit(): Long = version + 1
-    override def abort(): Unit = { }
-    override def id: StateStoreId = null
-    override def version: Long = 0
-    override def metrics: StateStoreMetrics = new StateStoreMetrics(map.size, 0, Map.empty)
-    override def hasCommitted: Boolean = true
-  }
 
   def assertCanGetProcessingTime(predicate: => Boolean): Unit = {
     if (!predicate) throw new TestFailedException("Could not get processing time", 20)
